@@ -8,24 +8,33 @@ Why cross-correlation instead of "close in space + close in time":
   between centroids (and guessing a frame-gap cutoff) is a crude proxy for
   "is this the same physical flare". Two blobs that really are the same
   flare will light up together across the WHOLE 1200-frame stack -- so their
-  ROI-averaged brightness traces will be strongly correlated, no matter how
-  far apart in time the individual detections were. Two blobs that are
-  merely nearby but physically different flares won't share a lighting-up
-  pattern, so their traces won't correlate.
+  footprint-averaged brightness traces will be strongly correlated, no
+  matter how far apart in time the individual detections were. Two blobs
+  that are merely nearby but physically different flares won't share a
+  lighting-up pattern, so their traces won't correlate.
+
+Each blob's trace is the mean dff over its OWN exact footprint pixels
+(from 01_detect_blobs.py) -- no synthetic circular ROI, no radius guess.
 
 Pipeline:
-  1. Load detections_raw.csv (each row: one blob, one frame, from 01)
-  2. For each blob, build a small ROI at its own centroid, sized from its
-     own area, and pull its mean-dff trace across all 1200 frames
-  3. Cross-correlate every pair of blob traces
-  4. Cluster blobs into zones: two blobs join the same zone if their traces
-     are correlated above CORR_THRESHOLD (transitively, via hierarchical
-     clustering on 1 - correlation as the distance)
+  1. Load detections_raw.csv + blob_footprints.npz (each row: one blob, one
+     frame, with its real pixel coordinates, from 01)
+  2. Pull each blob's mean-dff trace, over its own footprint, across all
+     1200 frames
+  3. Cross-correlate every pair of blob traces (zero-lag Pearson, all pairs
+     at once) -- exported as zone_corr_matrix.csv for inspection
+  4. Cluster blobs into zones: hierarchical (average-linkage) clustering on
+     a combined distance -- 1 - correlation, but forced to "maximally far"
+     for any pair beyond MAX_SPATIAL_DISTANCE apart. Average-linkage only
+     merges two groups when their AVERAGE cross-pairwise distance is low, so
+     a single distant pair discourages (not just forbids one edge, the way a
+     plain adjacency graph would) the whole groups from merging -- that
+     graph version was tried first and produced worse chaining, not less.
   5. Save every blob with its assigned zone id
 
-Requires: detections_raw.csv (from 01_detect_blobs.py), dff_utils.py
+Requires: detections_raw.csv, blob_footprints.npz (from 01_detect_blobs.py), dff_utils.py
 Run: uv run python 02_zone_groups.py [stack.tif] [output_suffix]
-Outputs: zone_groups.csv, zone_traces.png
+Outputs: zone_groups.csv, zone_traces.png, zone_corr_matrix.csv
 """
 
 import sys
@@ -33,7 +42,7 @@ import sys
 import numpy as np
 import pandas as pd
 from scipy.cluster.hierarchy import fcluster, linkage
-from scipy.spatial.distance import squareform
+from scipy.spatial.distance import squareform, pdist
 
 import matplotlib
 matplotlib.use("Agg")
@@ -51,57 +60,61 @@ STACK_PATH = sys.argv[1] if len(sys.argv) > 1 else "2025_12_15-0012_BIEXP_GAUSS.
 SUFFIX = f"_{sys.argv[2]}" if len(sys.argv) > 2 else ""
 
 RAW_DETECTIONS_CSV = f"detections_raw{SUFFIX}.csv"
+BLOB_FOOTPRINTS_NPZ = f"blob_footprints{SUFFIX}.npz"
 
-ROI_RADIUS_SCALE = 0.6  # shrink factor applied to each blob's own equivalent-circle
-                         # radius -- a smaller, centered ROI has cleaner contrast
-                         # than one spanning the whole (noisier-edged) blob
-ROI_RADIUS_MIN = 15     # px floor, in case a blob's area is tiny
-
-CORR_THRESHOLD = 0.5    # two blobs join the same zone if their full-length traces
+CORR_THRESHOLD = 0.75    # two blobs join the same zone if their full-length traces
                          # correlate above this. Same-flare detections (even from
                          # frames 1000 apart) reliably correlate ~0.9+; unrelated
                          # nearby blobs sit near 0 -- 0.5 sits well clear of both.
 
+MAX_SPATIAL_DISTANCE = 250  # px: correlation alone isn't enough -- two blobs on
+                             # opposite sides of the image can coincidentally
+                             # correlate above threshold (small sample size, shared
+                             # residual drift) and get merged despite being nowhere
+                             # near each other. A blob pair only joins the same zone
+                             # if it clears BOTH the correlation bar AND this
+                             # distance bar.
+
 ZONE_GROUPS_CSV = f"zone_groups{SUFFIX}.csv"
 ZONE_TRACES_PNG = f"zone_traces{SUFFIX}.png"
+ZONE_CORR_MATRIX_CSV = f"zone_corr_matrix{SUFFIX}.csv"
 
 
 # ---------------------------------------------------------------------------
-# 2. Build one small circular ROI per blob and pull its full trace
+# 2. Pull each blob's mean-dff trace over its own exact footprint
 # ---------------------------------------------------------------------------
 
-def blob_trace(dff: np.ndarray, cy: float, cx: float, radius: float) -> np.ndarray:
-    """Mean dff inside a small ROI around (cy, cx), per frame -> length-1200 trace.
-    Restricted to a local bounding box, not the full frame, for speed."""
-    H, W = dff.shape[1], dff.shape[2]
-    y0, y1 = max(0, int(cy - radius)), min(H, int(cy + radius) + 1)
-    x0, x1 = max(0, int(cx - radius)), min(W, int(cx + radius) + 1)
-    yy, xx = np.mgrid[y0:y1, x0:x1]
-    mask = np.hypot(yy - cy, xx - cx) <= radius
-    sub = dff[:, y0:y1, x0:x1]
-    return sub[:, mask].mean(axis=1)
-
-
-def all_blob_traces(dff: np.ndarray, blobs: pd.DataFrame) -> np.ndarray:
-    """(n_blobs, n_frames) matrix: one trace per blob."""
-    radii = np.maximum(ROI_RADIUS_MIN, ROI_RADIUS_SCALE * np.sqrt(blobs["area"] / np.pi))
-    traces = np.stack([
-        blob_trace(dff, row.y, row.x, r)
-        for row, r in zip(blobs.itertuples(), radii)
-    ])
-    return traces
+def all_blob_traces(dff: np.ndarray, n_blobs: int, footprints_path: str) -> np.ndarray:
+    """(n_blobs, n_frames) matrix: one trace per blob, using each blob's
+    own footprint pixels (not an approximated ROI)."""
+    with np.load(footprints_path) as footprints:
+        coords = [footprints[f"blob_{i}"] for i in range(n_blobs)]
+    return np.stack([dff[:, c[:, 0], c[:, 1]].mean(axis=1) for c in coords])
 
 
 # ---------------------------------------------------------------------------
 # 3. Cross-correlate every pair of traces, cluster into zones
 # ---------------------------------------------------------------------------
 
-def cluster_by_correlation(traces: np.ndarray, corr_threshold: float) -> np.ndarray:
-    """Zero-lag Pearson correlation between every pair of blob traces,
-    hierarchically clustered on (1 - correlation) as the distance."""
-    corr = np.corrcoef(traces)
+def correlation_matrix(traces: np.ndarray) -> np.ndarray:
+    """Zero-lag Pearson correlation between every pair of blob traces, all
+    N*(N-1)/2 pairs at once (np.corrcoef), not one pair at a time."""
+    return np.corrcoef(traces)
+
+
+def cluster_by_correlation(corr: np.ndarray, blobs: pd.DataFrame,
+                            corr_threshold: float, max_spatial_distance: float) -> np.ndarray:
+    """Hierarchical (average-linkage) clustering on 1 - correlation as the
+    distance, cut at distance (1 - corr_threshold) -- except any pair beyond
+    max_spatial_distance apart is forced to distance 1 (== zero correlation)
+    first, so a coincidentally-correlated but far-apart pair can never pull
+    two real clusters together."""
     distance = 1 - np.clip(corr, 0, 1)  # anti-correlated blobs are just as
                                          # "different" as uncorrelated ones
+
+    centroid_dist = squareform(pdist(blobs[["y", "x"]].values))
+    distance[centroid_dist > max_spatial_distance] = 1
+
     np.fill_diagonal(distance, 0)
     distance = (distance + distance.T) / 2  # force exact symmetry (fp round-trip)
 
@@ -140,8 +153,14 @@ def main() -> None:
     _, dff = load_dff(STACK_PATH)
 
     blobs = pd.read_csv(RAW_DETECTIONS_CSV)
-    traces = all_blob_traces(dff, blobs)
-    zones = cluster_by_correlation(traces, CORR_THRESHOLD)
+    traces = all_blob_traces(dff, len(blobs), BLOB_FOOTPRINTS_NPZ)
+    print(f"{len(blobs)} blob traces, each length {traces.shape[1]} frames")
+
+    corr = correlation_matrix(traces)
+    pd.DataFrame(corr).to_csv(ZONE_CORR_MATRIX_CSV, index=False)
+    print(f"saved {len(blobs)}x{len(blobs)} correlation matrix -> {ZONE_CORR_MATRIX_CSV}")
+
+    zones = cluster_by_correlation(corr, blobs, CORR_THRESHOLD, MAX_SPATIAL_DISTANCE)
 
     blobs = blobs.copy()
     blobs["zone"] = zones

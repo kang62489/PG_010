@@ -1,15 +1,19 @@
 """
-Merge each zone's blob footprints and render the final colored zone map.
+Paint each zone's blob footprints and render the final colored zone map.
+
+Every blob's exact footprint was already found once, in 01_detect_blobs.py,
+and its zone id was assigned in 02_zone_groups.py -- this step does no
+detection work at all, it just looks up each blob's stored pixel coordinates
+and paints them in its zone's color.
 
 Pipeline:
-  1. Load zone_groups.csv (every blob detection, already zone-assigned by 02)
-  2. Re-detect each blob's real footprint at its own frame (not just its
-     centroid point) and paint it with its zone's color -- this is the one
-     step that needs the raw stack again, so it runs last, once
+  1. Load zone_groups.csv (every blob, zone-assigned) + blob_footprints.npz
+     (each blob's exact pixel coordinates)
+  2. Paint each blob's footprint onto a full-size zone label map
   3. Render the painted zones over the stack's mean projection, save the
      picture and a per-zone table of which frames belong to which zone
 
-Requires: zone_groups.csv (from 02_zone_groups.py), dff_utils.py
+Requires: zone_groups.csv, blob_footprints.npz (from 02_zone_groups.py / 01_detect_blobs.py), dff_utils.py
 Run: uv run python 03_zone_map.py [stack.tif] [output_suffix]
 Outputs: zone_map.png, zone_map_events.csv
 """
@@ -18,9 +22,7 @@ import sys
 
 import numpy as np
 import pandas as pd
-from scipy import ndimage
 from skimage.color import label2rgb
-from skimage.measure import label, regionprops
 
 import matplotlib
 matplotlib.use("Agg")
@@ -38,46 +40,24 @@ STACK_PATH = sys.argv[1] if len(sys.argv) > 1 else "2025_12_15-0012_BIEXP_GAUSS.
 SUFFIX = f"_{sys.argv[2]}" if len(sys.argv) > 2 else ""
 
 ZONE_GROUPS_CSV = f"zone_groups{SUFFIX}.csv"
-
-THRESHOLD_PERCENTILE = 99.5  # must match 01_detect_blobs.py so footprints reproduce
-MIN_FOOTPRINT_AREA = 1000    # ignore a re-detected blob if it's implausibly small
+BLOB_FOOTPRINTS_NPZ = f"blob_footprints{SUFFIX}.npz"
 
 ZONE_MAP_PNG = f"zone_map{SUFFIX}.png"
 ZONE_MAP_EVENTS_CSV = f"zone_map_events{SUFFIX}.csv"
 
 
 # ---------------------------------------------------------------------------
-# 2. Paint each blob's real footprint onto a full-size zone label map
+# 2. Paint each blob's already-known footprint onto a full-size zone label map
 # ---------------------------------------------------------------------------
 
-def find_blob_footprint(frame: np.ndarray, threshold: float, near_yx: tuple[float, float]):
-    """Re-detect blobs in one frame and return the pixel coords of whichever
-    blob is closest to `near_yx` (the detection's recorded centroid)."""
-    mask = frame > threshold
-    mask = ndimage.binary_opening(mask, structure=np.ones((3, 3)))
-    mask = ndimage.binary_closing(mask, structure=np.ones((5, 5)))
-    regions = regionprops(label(mask))
-    if not regions:
-        return None
-    target = np.array(near_yx)
-    best = min(regions, key=lambda r: np.hypot(*(np.array(r.centroid) - target)))
-    if best.area < MIN_FOOTPRINT_AREA:
-        return None
-    return best.coords  # (N, 2) array of (y, x)
-
-
-def build_zone_label_map(blobs: pd.DataFrame, dff: np.ndarray,
-                          threshold: float) -> np.ndarray:
+def build_zone_label_map(blobs: pd.DataFrame, footprints_path: str, H: int, W: int) -> np.ndarray:
     """Full-size (H, W) int array: 0 = background, otherwise the zone id of
     whichever blob's footprint covers that pixel."""
-    H, W = dff.shape[1], dff.shape[2]
     zone_label_map = np.zeros((H, W), dtype=np.int32)
-
-    for row in blobs.itertuples():
-        coords = find_blob_footprint(dff[int(row.frame)], threshold, (row.y, row.x))
-        if coords is not None:
+    with np.load(footprints_path) as footprints:
+        for i, row in enumerate(blobs.itertuples()):
+            coords = footprints[f"blob_{i}"]
             zone_label_map[coords[:, 0], coords[:, 1]] = row.zone
-
     return zone_label_map
 
 
@@ -109,10 +89,10 @@ def render_zone_map(zone_label_map: np.ndarray, blobs: pd.DataFrame,
 
 def main() -> None:
     stack, dff = load_dff(STACK_PATH)
-    threshold = np.percentile(dff, THRESHOLD_PERCENTILE)
+    H, W = dff.shape[1], dff.shape[2]
 
     blobs = pd.read_csv(ZONE_GROUPS_CSV)
-    zone_label_map = build_zone_label_map(blobs, dff, threshold)
+    zone_label_map = build_zone_label_map(blobs, BLOB_FOOTPRINTS_NPZ, H, W)
 
     background = stack.mean(axis=0)
     render_zone_map(zone_label_map, blobs, background, ZONE_MAP_PNG)
