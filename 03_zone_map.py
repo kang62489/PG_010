@@ -1,19 +1,14 @@
 """
-Paint each zone's blob footprints and render the final colored zone map.
-
-Every blob's exact footprint was already found once, in 01_detect_blobs.py,
-and its zone id was assigned in 02_zone_groups.py -- this step does no
-detection work at all, it just looks up each blob's stored pixel coordinates
-and paints them in its zone's color.
+Paint each zone's hotspot footprints and render the final colored zone map.
+Does no detection work -- just looks up stored footprints/zone ids.
 
 Pipeline:
-  1. Load zone_groups.csv (every blob, zone-assigned) + blob_footprints.npz
-     (each blob's exact pixel coordinates)
-  2. Paint each blob's footprint onto a full-size zone label map
-  3. Render the painted zones over the stack's mean projection, save the
-     picture and a per-zone table of which frames belong to which zone
+  1. Load zone_groups.csv + hotspot_footprints.npz
+  2. Paint each footprint onto a full-size zone label map
+  3. Render over the stack's mean projection; save the picture + a
+     per-zone table of which frames belong to which zone
 
-Requires: zone_groups.csv, blob_footprints.npz (from 02_zone_groups.py / 01_detect_blobs.py), dff_utils.py
+Requires: zone_groups.csv, hotspot_footprints.npz (from 02_zone_groups.py / 01_detect_blobs.py)
 Run: uv run python 03_zone_map.py [stack.tif] [output_suffix]
 Outputs: zone_map.png, zone_map_events.csv
 """
@@ -22,13 +17,12 @@ import sys
 
 import numpy as np
 import pandas as pd
+import tifffile
 from skimage.color import label2rgb
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
-from dff_utils import load_dff
 
 # ---------------------------------------------------------------------------
 # 1. Config
@@ -40,14 +34,24 @@ STACK_PATH = sys.argv[1] if len(sys.argv) > 1 else "2025_12_15-0012_BIEXP_GAUSS.
 SUFFIX = f"_{sys.argv[2]}" if len(sys.argv) > 2 else ""
 
 ZONE_GROUPS_CSV = f"zone_groups{SUFFIX}.csv"
-BLOB_FOOTPRINTS_NPZ = f"blob_footprints{SUFFIX}.npz"
+HOTSPOT_FOOTPRINTS_NPZ = f"hotspot_footprints{SUFFIX}.npz"
 
 ZONE_MAP_PNG = f"zone_map{SUFFIX}.png"
 ZONE_MAP_EVENTS_CSV = f"zone_map_events{SUFFIX}.csv"
 
 
 # ---------------------------------------------------------------------------
-# 2. Paint each blob's already-known footprint onto a full-size zone label map
+# 2. Load the stack (already deltaF/F0 -- no baseline subtraction here)
+# ---------------------------------------------------------------------------
+
+def load_stack(stack_path: str) -> tuple[np.ndarray, np.ndarray]:
+    stack = tifffile.imread(stack_path)
+    stack_f16 = stack.astype(np.float16)
+    return stack, stack_f16
+
+
+# ---------------------------------------------------------------------------
+# 3. Paint each blob's already-known footprint onto a full-size zone label map
 # ---------------------------------------------------------------------------
 
 def build_zone_label_map(blobs: pd.DataFrame, footprints_path: str, H: int, W: int) -> np.ndarray:
@@ -56,13 +60,13 @@ def build_zone_label_map(blobs: pd.DataFrame, footprints_path: str, H: int, W: i
     zone_label_map = np.zeros((H, W), dtype=np.int32)
     with np.load(footprints_path) as footprints:
         for i, row in enumerate(blobs.itertuples()):
-            coords = footprints[f"blob_{i}"]
+            coords = footprints[f"hotspot_{i}"]
             zone_label_map[coords[:, 0], coords[:, 1]] = row.zone
     return zone_label_map
 
 
 # ---------------------------------------------------------------------------
-# 3. Render the colored zone map
+# 4. Render the colored zone map
 # ---------------------------------------------------------------------------
 
 def render_zone_map(zone_label_map: np.ndarray, blobs: pd.DataFrame,
@@ -84,15 +88,15 @@ def render_zone_map(zone_label_map: np.ndarray, blobs: pd.DataFrame,
 
 
 # ---------------------------------------------------------------------------
-# 4. Run the pipeline
+# 5. Run the pipeline
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    stack, dff = load_dff(STACK_PATH)
-    H, W = dff.shape[1], dff.shape[2]
+    stack, stack_f16 = load_stack(STACK_PATH)
+    H, W = stack_f16.shape[1], stack_f16.shape[2]
 
     blobs = pd.read_csv(ZONE_GROUPS_CSV)
-    zone_label_map = build_zone_label_map(blobs, BLOB_FOOTPRINTS_NPZ, H, W)
+    zone_label_map = build_zone_label_map(blobs, HOTSPOT_FOOTPRINTS_NPZ, H, W)
 
     background = stack.mean(axis=0)
     render_zone_map(zone_label_map, blobs, background, ZONE_MAP_PNG)
