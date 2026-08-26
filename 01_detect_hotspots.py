@@ -9,7 +9,7 @@ Pipeline:
 Run: uv run python 01_detect_hotspots.py [stack.tif] [output_suffix]
 
 Outputs:
-  - per-frame cleaned boolean mask (mask.npz)
+  - per-frame cleaned boolean mask, as a viewable uint8 TIFF (results/mask.tif)
 """
 
 ## Modules
@@ -22,27 +22,30 @@ from functools import partial
 import numpy as np
 import pandas as pd
 import tifffile
+from rich.console import Console
 from scipy import ndimage
 from scipy.optimize import curve_fit
+
+console = Console()
 
 # ---------------------------------------------------------------------------
 # 1. Config
 #    Usage: uv run python 01_detect_hotspots.py [stack.tif] [output_suffix]
 # ---------------------------------------------------------------------------
 
-STACK_PATH = sys.argv[1] if len(sys.argv) > 1 else "2025_12_15-0012_BIEXP_GAUSS.tif"
-SUFFIX = f"_{sys.argv[2]}" if len(sys.argv) > 2 else ""
+STACK_PATH = sys.argv[1] if len(sys.argv) > 1 else "proc_tiffs/2025_12_15-0012_BIEXP_ALS.tif"
+SUFFIX = f"_{sys.argv[2]}" if len(sys.argv) > 2 else "_ALS"
 
 HISTOGRAM_BINS = 512  # resolution/division of the range/distribution of pixel values (df/F0)
                       # (max - min) / HISTOGRAM_BINS = width of each bin in the histogram
                       # x is the center of each bin, y is the count of pixels in that bin.
 
-CROSSOVER_RATIO = 3.0  # the ratio used to determine if the current x (right side of the bell curve) 
+CROSSOVER_RATIO = 1.5  # the ratio used to determine if the current x (right side of the bell curve) 
                        # is enough to be the right edge (thresold) of the background.
 
-TH_SMALL_OBJ = 800  # remove small objects (px) before linking, general cleaning of noise speckle.
+TH_SMALL_OBJ = 4000  # remove small objects (px) before linking, general cleaning of noise speckle.
 
-MASK_NPZ = f"mask{SUFFIX}.npz"
+MASK_TIF = f"results/mask{SUFFIX}.tif"
 
 
 # ---------------------------------------------------------------------------
@@ -129,13 +132,14 @@ def main() -> None:
 
     _, stack_f16 = load_stack(STACK_PATH)
     threshold = find_background_threshold(stack_f16)
-    print(f"background threshold (Gaussian-fit crossover, ratio={CROSSOVER_RATIO}): {threshold:.5f}")
+    console.print(f"[cyan]background threshold[/cyan] (Gaussian-fit crossover, ratio={CROSSOVER_RATIO}): "
+                  f"[bold]{threshold:.5f}[/bold]")
 
     mask = detect_all_frames(stack_f16, threshold)
-    np.savez_compressed(MASK_NPZ, mask=mask)
+    tifffile.imwrite(MASK_TIF, (mask.astype(np.uint8) * 255))
 
-    print(f"saved cleaned mask {mask.shape} -> {MASK_NPZ}")
-    print(f"Total time: {time.time() - t_start:.1f}s")
+    console.print(f"[green]saved[/green] cleaned mask {mask.shape} -> [bold]{MASK_TIF}[/bold]")
+    console.print(f"[dim]Total time: {time.time() - t_start:.1f}s[/dim]")
 
 
 if __name__ == "__main__":
