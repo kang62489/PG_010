@@ -5,14 +5,14 @@ fixed_roi_traces(), and cluster_by_correlation() for how.
 
 Pipeline:
   1. Load detections_raw.csv + hotspot_footprints.npz (from 01), each row
-     tagged with a track_id
+     tagged with a joint_label
   2. Collapse to one representative centroid per track
   3. Pull each track's fixed-ROI deltaF/F0 trace, across the whole stack
   4. Cluster tracks by trace correlation (gated by centroid distance) ->
      zones, saved as zone_corr_matrix.csv
-  5. Map each detection's zone from its track_id and save zone_groups.csv
+  5. Map each detection's zone from its joint_label and save zone_groups.csv
 
-Requires: detections_raw.csv, hotspot_footprints.npz (from 01_detect_blobs.py)
+Requires: detections_raw.csv, hotspot_footprints.npz (from 01_detect_hotspots.py)
 Run: uv run python 02_zone_groups.py [stack.tif] [output_suffix]
 Outputs: zone_groups.csv, zone_traces.png, zone_corr_matrix.csv
 """
@@ -32,14 +32,14 @@ import matplotlib.pyplot as plt
 # ---------------------------------------------------------------------------
 # 1. Config
 #    Usage: uv run python 02_zone_groups.py [stack.tif] [output_suffix]
-#    Suffix must match the one used for 01_detect_blobs.py's outputs.
+#    Suffix must match the one used for 01_detect_hotspots.py's outputs.
 # ---------------------------------------------------------------------------
 
 STACK_PATH = sys.argv[1] if len(sys.argv) > 1 else "2025_12_15-0012_BIEXP_GAUSS.tif"
 SUFFIX = f"_{sys.argv[2]}" if len(sys.argv) > 2 else ""
 
 RAW_DETECTIONS_CSV = f"detections_raw{SUFFIX}.csv"
-BLOB_FOOTPRINTS_NPZ = f"hotspot_footprints{SUFFIX}.npz"
+HOTSPOT_FOOTPRINTS_NPZ = f"hotspot_footprints{SUFFIX}.npz"
 
 MAX_CENTROID_DEVIATION = 30  # px: two tracks can only be the same zone if
                               # their centroids stay within this of each
@@ -74,10 +74,10 @@ def load_stack(stack_path: str) -> tuple[np.ndarray, np.ndarray]:
 # 3. One representative centroid per track + its fixed-ROI trace
 # ---------------------------------------------------------------------------
 
-def track_centroids(blobs: pd.DataFrame) -> tuple[list, np.ndarray]:
-    """One (y, x) centroid per track_id, averaged across every detection
+def track_centroids(hotspots: pd.DataFrame) -> tuple[list, np.ndarray]:
+    """One (y, x) centroid per joint_label, averaged across every detection
     (frame-appearance) confirmed to be that same physical hotspot."""
-    grouped = blobs.groupby("track_id")[["y", "x"]].mean()
+    grouped = hotspots.groupby("joint_label")[["y", "x"]].mean()
     return grouped.index.tolist(), grouped.values
 
 
@@ -125,11 +125,11 @@ def cluster_by_correlation(corr: np.ndarray, centroid_dist: np.ndarray,
 #    sanity-check plot only -- no part of clustering.
 # ---------------------------------------------------------------------------
 
-def all_blob_traces(stack_f16: np.ndarray, n_blobs: int, footprints_path: str) -> np.ndarray:
-    """(n_blobs, n_frames) matrix: one trace per detection, using each
+def all_hotspot_traces(stack_f16: np.ndarray, n_hotspots: int, footprints_path: str) -> np.ndarray:
+    """(n_hotspots, n_frames) matrix: one trace per detection, using each
     detection's own footprint pixels (not the fixed ROI used for clustering)."""
     with np.load(footprints_path) as footprints:
-        coords = [footprints[f"hotspot_{i}"] for i in range(n_blobs)]
+        coords = [footprints[f"hotspot_{i}"] for i in range(n_hotspots)]
     return np.stack([stack_f16[:, c[:, 0], c[:, 1]].mean(axis=1) for c in coords])
 
 
@@ -159,10 +159,10 @@ def render_zone_traces(traces: np.ndarray, zones: np.ndarray, out_path: str) -> 
 def main() -> None:
     _, stack_f16 = load_stack(STACK_PATH)
 
-    blobs = pd.read_csv(RAW_DETECTIONS_CSV)
-    print(f"{len(blobs)} hotspot detections")
+    hotspots = pd.read_csv(RAW_DETECTIONS_CSV)
+    print(f"{len(hotspots)} hotspot detections")
 
-    track_ids, centroids = track_centroids(blobs)
+    track_ids, centroids = track_centroids(hotspots)
     print(f"{len(track_ids)} 3D-confirmed hotspot tracks")
 
     centroid_dist = squareform(pdist(centroids))
@@ -175,14 +175,14 @@ def main() -> None:
     track_zones = cluster_by_correlation(corr, centroid_dist, MIN_TRACE_CORR, MAX_CENTROID_DEVIATION)
     zone_by_track = dict(zip(track_ids, track_zones))
 
-    blobs = blobs.copy()
-    blobs["zone"] = blobs["track_id"].map(zone_by_track)
-    blobs.to_csv(ZONE_GROUPS_CSV, index=False)
+    hotspots = hotspots.copy()
+    hotspots["zone"] = hotspots["joint_label"].map(zone_by_track)
+    hotspots.to_csv(ZONE_GROUPS_CSV, index=False)
 
-    detection_traces = all_blob_traces(stack_f16, len(blobs), BLOB_FOOTPRINTS_NPZ)
-    render_zone_traces(detection_traces, blobs["zone"].values, ZONE_TRACES_PNG)
+    detection_traces = all_hotspot_traces(stack_f16, len(hotspots), HOTSPOT_FOOTPRINTS_NPZ)
+    render_zone_traces(detection_traces, hotspots["zone"].values, ZONE_TRACES_PNG)
 
-    print(f"{blobs['zone'].nunique()} zones from {len(track_ids)} tracks ({len(blobs)} detections) "
+    print(f"{hotspots['zone'].nunique()} zones from {len(track_ids)} tracks ({len(hotspots)} detections) "
           f"(max_centroid_deviation={MAX_CENTROID_DEVIATION}px, roi_radius={ROI_RADIUS}px, "
           f"min_trace_corr={MIN_TRACE_CORR})")
     print(f"saved {ZONE_GROUPS_CSV}, {ZONE_TRACES_PNG}")

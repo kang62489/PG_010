@@ -8,7 +8,7 @@ Pipeline:
   3. Render over the stack's mean projection; save the picture + a
      per-zone table of which frames belong to which zone
 
-Requires: zone_groups.csv, hotspot_footprints.npz (from 02_zone_groups.py / 01_detect_blobs.py)
+Requires: zone_groups.csv, hotspot_footprints.npz (from 02_zone_groups.py / 01_detect_hotspots.py)
 Run: uv run python 03_zone_map.py [stack.tif] [output_suffix]
 Outputs: zone_map.png, zone_map_events.csv
 """
@@ -51,15 +51,15 @@ def load_stack(stack_path: str) -> tuple[np.ndarray, np.ndarray]:
 
 
 # ---------------------------------------------------------------------------
-# 3. Paint each blob's already-known footprint onto a full-size zone label map
+# 3. Paint each hotspot's already-known footprint onto a full-size zone label map
 # ---------------------------------------------------------------------------
 
-def build_zone_label_map(blobs: pd.DataFrame, footprints_path: str, H: int, W: int) -> np.ndarray:
+def build_zone_label_map(hotspots: pd.DataFrame, footprints_path: str, H: int, W: int) -> np.ndarray:
     """Full-size (H, W) int array: 0 = background, otherwise the zone id of
-    whichever blob's footprint covers that pixel."""
+    whichever hotspot's footprint covers that pixel."""
     zone_label_map = np.zeros((H, W), dtype=np.int32)
     with np.load(footprints_path) as footprints:
-        for i, row in enumerate(blobs.itertuples()):
+        for i, row in enumerate(hotspots.itertuples()):
             coords = footprints[f"hotspot_{i}"]
             zone_label_map[coords[:, 0], coords[:, 1]] = row.zone
     return zone_label_map
@@ -69,7 +69,7 @@ def build_zone_label_map(blobs: pd.DataFrame, footprints_path: str, H: int, W: i
 # 4. Render the colored zone map
 # ---------------------------------------------------------------------------
 
-def render_zone_map(zone_label_map: np.ndarray, blobs: pd.DataFrame,
+def render_zone_map(zone_label_map: np.ndarray, hotspots: pd.DataFrame,
                      background: np.ndarray, out_path: str) -> None:
     bg_norm = (background - background.min()) / (background.max() - background.min())
     overlay = label2rgb(zone_label_map, image=bg_norm, bg_label=0, alpha=0.5,
@@ -77,11 +77,11 @@ def render_zone_map(zone_label_map: np.ndarray, blobs: pd.DataFrame,
 
     fig, ax = plt.subplots(figsize=(11, 11))
     ax.imshow(overlay)
-    for zone_id, group in blobs.groupby("zone"):
+    for zone_id, group in hotspots.groupby("zone"):
         cy, cx = group.y.mean(), group.x.mean()
         ax.text(cx, cy, str(zone_id), color="white", fontsize=11, fontweight="bold",
                 ha="center", va="center", bbox=dict(boxstyle="circle", fc="black", alpha=0.6))
-    ax.set_title(f"{blobs['zone'].nunique()} spatial zones (cross-correlation grouping)")
+    ax.set_title(f"{hotspots['zone'].nunique()} spatial zones (cross-correlation grouping)")
     ax.axis("off")
     plt.tight_layout()
     plt.savefig(out_path, dpi=120)
@@ -95,15 +95,15 @@ def main() -> None:
     stack, stack_f16 = load_stack(STACK_PATH)
     H, W = stack_f16.shape[1], stack_f16.shape[2]
 
-    blobs = pd.read_csv(ZONE_GROUPS_CSV)
-    zone_label_map = build_zone_label_map(blobs, HOTSPOT_FOOTPRINTS_NPZ, H, W)
+    hotspots = pd.read_csv(ZONE_GROUPS_CSV)
+    zone_label_map = build_zone_label_map(hotspots, HOTSPOT_FOOTPRINTS_NPZ, H, W)
 
     background = stack.mean(axis=0)
-    render_zone_map(zone_label_map, blobs, background, ZONE_MAP_PNG)
+    render_zone_map(zone_label_map, hotspots, background, ZONE_MAP_PNG)
     print(f"saved {ZONE_MAP_PNG}")
 
-    blobs.to_csv(ZONE_MAP_EVENTS_CSV, index=False)
-    for zone_id, group in blobs.groupby("zone"):
+    hotspots.to_csv(ZONE_MAP_EVENTS_CSV, index=False)
+    for zone_id, group in hotspots.groupby("zone"):
         frames = " ".join(str(int(f)) for f in sorted(group["frame"]))
         print(f"Zone {zone_id} (n={len(group)}): {frames}")
 
