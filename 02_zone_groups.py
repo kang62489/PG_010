@@ -3,15 +3,13 @@ Categorize all detected hotspots as "zone" based on temporal correlation, centro
 
 Pipeline:
   1. Load stack + cleaned boolean mask (from 01)
-  2. Bridge same-frame gaps only (spatial dilation within one frame)
-  3. Join real per-frame hotspots across up to temporal_gap empty frames,
-     by real-footprint proximity -- no cross-frame dilation -- and build
-     every detection's frame, joint_label, centroid, and area
-  4. Collapse to one representative centroid per track
-  5. Pull each track's fixed-ROI deltaF/F0 trace, across the whole stack
-  6. Cluster tracks by trace correlation (gated by centroid distance) ->
+  2. Bridge spatial/temporal gaps in the mask, label in 3D, and build every
+     detection's frame, joint_label, centroid, and area
+  3. Collapse to one representative centroid per track
+  4. Pull each track's fixed-ROI deltaF/F0 trace, across the whole stack
+  5. Cluster tracks by trace correlation (gated by centroid distance) ->
      zones, saved as zone_corr_matrix.csv
-  7. Map each detection's zone from its joint_label and save zone_groups.csv
+  6. Map each detection's zone from its joint_label and save zone_groups.csv
 
 Requires: mask.tif (from 01_detect_hotspots.py)
 Run: uv run python 02_zone_groups.py [stack.tif] [output_suffix]
@@ -58,7 +56,7 @@ TEMPORAL_GAP = 1  # frames: also bridge across this many frames before/after,
                    # (confirmed by both touching a single hotspot in a
                    # neighboring frame) get merged instead of counted twice
 
-# centroid, joint_label, frame, y, x, footprint_pixels
+# frame, joint_label, centroid_y, centroid_x, area
 RAW_DETECTIONS_CSV = f"results/detections_raw{SUFFIX}.csv"
 
 # pixel coordinates of all detected hotspots
@@ -84,113 +82,75 @@ ZONE_CORR_MATRIX_CSV = f"results/zone_corr_matrix{SUFFIX}.csv"
 
 
 # ---------------------------------------------------------------------------
-# 2. Same-frame spatial merge -> per-frame hotspots (real footprints only)
+# 2. Bridge the mask in 3D (spatial only) and build per-detection rows
 # ---------------------------------------------------------------------------
 
-def spatially_connect_hotspots(mask: np.ndarray, connect_radius: int) -> tuple[list[dict], int]:
-    """Bridge fragments that belong to the same real hotspot WITHIN one
-    frame only (a noisy dip splitting one object into two pieces at the
-    same instant). No cross-frame reach here at all."""
+def spatiotemporally_connect_hotspots(mask: np.ndarray, th_small_hotspots: int,
+                                connect_radius: int, temporal_gap: int) -> tuple[pd.DataFrame, list]:
     t_start = time.time()
-    console.print("[cyan]spatially_connect_hotspots:[/cyan] starting...")
-
-    n_frames = mask.shape[0]
+    console.print("[cyan]spatiotemporally_connect_hotspots:[/cyan] starting...")
 
     # count hotspots in the input mask before any bridging, for comparison
     _, n_before = ndimage.label(mask, structure=np.ones((3, 3, 3)))
-    console.print(f"[cyan]spatially_connect_hotspots:[/cyan] counted {n_before} raw hotspots "
+    console.print(f"[cyan]spatiotemporally_connect_hotspots:[/cyan] counted {n_before} raw hotspots "
                   f"[dim]({time.time() - t_start:.1f}s)[/dim]")
 
-    # spatially dilate each frame in-plane, then label that frame in 2D, then
-    # AND back with the real mask to strip the dilation padding off again --
-    # every footprint below is real pixels only, never inflated.
-    spatial_bridged = ndimage.binary_dilation(mask, structure=np.ones((1, connect_radius, connect_radius)))
-    frame_hotspots = []
-    for frame_id in range(n_frames):
-        labeled2d, n = ndimage.label(spatial_bridged[frame_id], structure=np.ones((3, 3)))
-        for local_label in range(1, n + 1):
-            footprint = mask[frame_id] & (labeled2d == local_label)
-            if footprint.any():
-                frame_hotspots.append({"frame": frame_id, "footprint": footprint})
+    # using a 3D array, dilation with a 2D structure array stacked across 3 frames reaches the frame before and after the current frame (determined by temporal_gap = 1).
+    bridged_mask = ndimage.binary_dilation(mask, structure=np.ones((1 + 2 * temporal_gap, 1, 1)))
+    # use dilation to check if two adjacent hotspots are actually one hotspot, if so, connect them (using OR operation).
+    bridged_mask = ndimage.binary_dilation(bridged_mask, structure=np.ones((1, connect_radius, connect_radius)))
+    # apply new label index to bridged_mask for several measurements with regionprops later
+    labeled_bridged_mask, n_after = ndimage.label(bridged_mask, structure=np.ones((3, 3, 3)), output=np.int32)
+    del bridged_mask
+    console.print(f"[cyan]spatiotemporally_connect_hotspots:[/cyan] labeling done [dim]({time.time() - t_start:.1f}s)[/dim]")
 
-    console.print(f"[green]spatially_connect_hotspots: done[/green], {len(frame_hotspots)} per-frame hotspots "
-                  f"[dim]({time.time() - t_start:.1f}s total)[/dim]")
-    return frame_hotspots, n_before
+    # remove the connecting pixels (dilated pixels) from labeled_bridged_mask by AND operation with the original mask
+    hotspots_props = []
+    footprints = []
 
 
-# ---------------------------------------------------------------------------
-# 3. Cross-frame merge -> joint_label per track + detection rows
-# ---------------------------------------------------------------------------
-
-def uf_find(parent: list[int], i: int) -> int:
-    """Union-find with path compression."""
-    while parent[i] != i:
-        parent[i] = parent[parent[i]]
-        i = parent[i]
-    return i
+    next_joint_label = 1
+    current_joint_label: dict[int, int] = {}  # true_joint_label -> joint_label currently in use
+    last_seen_frame: dict[int, int] = {}     # true_joint_label -> last frame_id it produced a row for
 
 
-def uf_union(parent: list[int], a: int, b: int) -> None:
-    ra, rb = uf_find(parent, a), uf_find(parent, b)
-    if ra != rb:
-        parent[ra] = rb
+    for frame_id in range(mask.shape[0]):
+        for true_joint_label in np.unique(labeled_bridged_mask[frame_id][mask[frame_id]]):
+            footprint_mask = mask[frame_id] & (labeled_bridged_mask[frame_id] == true_joint_label)
+            area = int(footprint_mask.sum())
+            if area < th_small_hotspots:
+                continue
 
 
-def temporally_connect_hotspots(frame_hotspots: list[dict], th_small_hotspots: int, connect_radius: int,
-                                 temporal_gap: int, n_before: int) -> tuple[pd.DataFrame, list]:
-    """Join two per-frame hotspots into the same track only if their REAL
-    (undilated) footprints are within connect_radius of each other, checked
-    directly frame-to-frame -- an empty frame in between (up to temporal_gap
-    of them) is skipped over, never filled with synthetic pixels."""
-    t_start = time.time()
-    console.print("[cyan]temporally_connect_hotspots:[/cyan] starting...")
+            # a real gap since this true_joint_label's last row means dilation
+            # bridged it across empty frames -- split it into a new joint_label
+            # instead of reporting a fake continuous track through the gap.
+            true_joint_label = int(true_joint_label)
+            if true_joint_label not in current_joint_label or frame_id - last_seen_frame[true_joint_label] > 1:
+                current_joint_label[true_joint_label] = next_joint_label
+                next_joint_label += 1
+            last_seen_frame[true_joint_label] = frame_id
 
-    by_frame: dict[int, list[int]] = {}
-    for i, h in enumerate(frame_hotspots):
-        by_frame.setdefault(h["frame"], []).append(i)
+            # write the split joint_label into labeled_bridged_mask itself, so labeled_bridged_mask no
+            # longer disagrees with what's reported in the CSV.
+            labeled_bridged_mask[frame_id][footprint_mask] = current_joint_label[true_joint_label]
 
-    parent = list(range(len(frame_hotspots)))
+            coords = np.argwhere(footprint_mask)
+            footprints.append(coords)
+            hotspots_props.append({
+                "frame": frame_id + 1,  # 1-based for the CSV; loop/array indexing stays 0-based
+                "joint_label": current_joint_label[true_joint_label],
+                "centroid_y": float(coords[:, 0].mean()),
+                "centroid_x": float(coords[:, 1].mean()),
+                "area": area,
+            })
 
-    for frame_id, idxs in by_frame.items():
-        dilated = {i: ndimage.binary_dilation(frame_hotspots[i]["footprint"],
-                                               structure=np.ones((connect_radius, connect_radius)))
-                   for i in idxs}
-        for dt in range(1, temporal_gap + 2):
-            for j in by_frame.get(frame_id + dt, []):
-                for i in idxs:
-                    if dilated[i][frame_hotspots[j]["footprint"]].any():
-                        uf_union(parent, i, j)
-    console.print(f"[cyan]temporally_connect_hotspots:[/cyan] cross-frame merge done "
-                  f"[dim]({time.time() - t_start:.1f}s)[/dim]")
-
-    root_to_label: dict[int, int] = {}
-    for i in range(len(frame_hotspots)):
-        root = uf_find(parent, i)
-        if root not in root_to_label:
-            root_to_label[root] = len(root_to_label) + 1
-    n_after = len(root_to_label)
+    n_after = next_joint_label - 1
     console.print(f"hotspots in input mask: {n_before} -> after spatial/temporal connecting: [bold]{n_after}[/bold] "
                   f"([yellow]{n_before - n_after} merged[/yellow])")
-
-    detections = []
-    footprints = []
-    for i, h in enumerate(frame_hotspots):
-        footprint = h["footprint"]
-        area = int(footprint.sum())
-        if area < th_small_hotspots:
-            continue
-        coords = np.argwhere(footprint)
-        footprints.append(coords)
-        detections.append({
-            "frame": h["frame"] + 1,  # 1-based for the CSV; loop/array indexing stays 0-based
-            "joint_label": root_to_label[uf_find(parent, i)],
-            "y": float(coords[:, 0].mean()),
-            "x": float(coords[:, 1].mean()),
-            "area": area,
-        })
-    console.print(f"[green]temporally_connect_hotspots: done[/green], {len(detections)} detections "
+    console.print(f"[green]spatiotemporally_connect_hotspots: done[/green], {len(hotspots_props)} detections "
                   f"[dim]({time.time() - t_start:.1f}s total)[/dim]")
-    return pd.DataFrame(detections), footprints
+    return pd.DataFrame(hotspots_props), footprints
 
 
 # ---------------------------------------------------------------------------
@@ -207,10 +167,10 @@ def load_stack(stack_path: str) -> tuple[np.ndarray, np.ndarray]:
 # 4. One representative centroid per track + its fixed-ROI trace
 # ---------------------------------------------------------------------------
 
-def track_centroids(hotspots: pd.DataFrame) -> tuple[list, np.ndarray]:
+def track_centroids(hotspots_props: pd.DataFrame) -> tuple[list, np.ndarray]:
     """One (y, x) centroid per joint_label, averaged across every detection
     (frame-appearance) confirmed to be that same physical hotspot."""
-    grouped = hotspots.groupby("joint_label")[["y", "x"]].mean()
+    grouped = hotspots_props.groupby("joint_label")[["centroid_y", "centroid_x"]].mean()
     return grouped.index.tolist(), grouped.values
 
 
@@ -294,35 +254,34 @@ def main() -> None:
 
     mask = tifffile.imread(MASK_TIF) > 0
 
-    frame_hotspots, n_before = spatially_connect_hotspots(mask, CONNECT_RADIUS)
-    hotspots, footprints = temporally_connect_hotspots(frame_hotspots, TH_SMALL_HOTSPOTS, CONNECT_RADIUS,
-                                                       TEMPORAL_GAP, n_before)
-    hotspots.to_csv(RAW_DETECTIONS_CSV, index=False)
+    hotspots_props, footprints = spatiotemporally_connect_hotspots(mask, TH_SMALL_HOTSPOTS, CONNECT_RADIUS, TEMPORAL_GAP)
+    hotspots_props.to_csv(RAW_DETECTIONS_CSV, index=False)
     np.savez(HOTSPOT_FOOTPRINTS_NPZ, **{f"hotspot_{i}": coords for i, coords in enumerate(footprints)})
-    console.print(f"[bold]{len(hotspots)}[/bold] raw hotspot detections above area {TH_SMALL_HOTSPOTS} -> "
+    console.print(f"[bold]{len(hotspots_props)}[/bold] raw hotspot detections above area {TH_SMALL_HOTSPOTS} -> "
                   f"{RAW_DETECTIONS_CSV}, {HOTSPOT_FOOTPRINTS_NPZ}")
 
-    # --- TEMP: bypassed past spatially_connect_hotspots for step-by-step check ---
-    # track_ids, centroids = track_centroids(hotspots)
-    # console.print(f"[bold]{len(track_ids)}[/bold] 3D-confirmed hotspot tracks")
-    #
-    # centroid_dist = squareform(pdist(centroids))
-    #
+    joint_labels, centroids = track_centroids(hotspots_props)
+    console.print(f"[bold]{len(joint_labels)}[/bold] 3D-confirmed hotspot tracks")
+
+    # get the array of pairwise centroid distances
+    centroid_dist = squareform(pdist(centroids))
+    
+    # --- TEMP: bypassed past spatiotemporally_connect_hotspots for step-by-step check ---
     # traces = fixed_roi_traces(stack_f16, centroids, ROI_RADIUS)
     # corr = np.corrcoef(traces)
     # pd.DataFrame(corr).to_csv(ZONE_CORR_MATRIX_CSV, index=False)
-    # console.print(f"[green]saved[/green] {len(track_ids)}x{len(track_ids)} track-level ROI trace correlation "
+    # console.print(f"[green]saved[/green] {len(joint_labels)}x{len(joint_labels)} track-level ROI trace correlation "
     #               f"matrix -> {ZONE_CORR_MATRIX_CSV}")
     #
     # track_zones = cluster_by_correlation(corr, centroid_dist, MIN_TRACE_CORR, MAX_CENTROID_DEVIATION)
-    # zone_by_track = dict(zip(track_ids, track_zones))
+    # zone_by_track = dict(zip(joint_labels, track_zones))
     #
-    # hotspots = hotspots.copy()
-    # hotspots["zone"] = hotspots["joint_label"].map(zone_by_track)
-    # hotspots.to_csv(ZONE_GROUPS_CSV, index=False)
+    # hotspots_props = hotspots_props.copy()
+    # hotspots_props["zone"] = hotspots_props["joint_label"].map(zone_by_track)
+    # hotspots_props.to_csv(ZONE_GROUPS_CSV, index=False)
     #
-    # detection_traces = all_hotspot_traces(stack_f16, len(hotspots), HOTSPOT_FOOTPRINTS_NPZ)
-    # render_zone_traces(detection_traces, hotspots["zone"].values, ZONE_TRACES_PNG)
+    # detection_traces = all_hotspot_traces(stack_f16, len(hotspots_props), HOTSPOT_FOOTPRINTS_NPZ)
+    # render_zone_traces(detection_traces, hotspots_props["zone"].values, ZONE_TRACES_PNG)
     #
     # console.print(f"[bold]{hotspots['zone'].nunique()}[/bold] zones from {len(track_ids)} tracks "
     #               f"({len(hotspots)} detections) [dim](max_centroid_deviation={MAX_CENTROID_DEVIATION}px, "
