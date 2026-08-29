@@ -40,10 +40,15 @@ HISTOGRAM_BINS = 512  # resolution/division of the range/distribution of pixel v
                       # (max - min) / HISTOGRAM_BINS = width of each bin in the histogram
                       # x is the center of each bin, y is the count of pixels in that bin.
 
-CROSSOVER_RATIO = 1.5  # the ratio used to determine if the current x (right side of the bell curve) 
-                       # is enough to be the right edge (thresold) of the background.
+CROSSOVER_RATIO = 2  # background threshold = peak + this many fitted-Gaussian
+                       # sigmas -- the wider the background's noise spread, the
+                       # farther out this pushes the threshold.
 
 TH_SMALL_OBJ = 4000  # remove small objects (px) before linking, general cleaning of noise speckle.
+
+CLOSE_RADIUS = 3  # px: morphological closing (dilate then erode) after opening --
+                   # bridges small notches/gaps in a hotspot's own per-frame shape
+                   # so it fills in as one simple blob, not a jagged/split one.
 
 MASK_TIF = f"results/mask{SUFFIX}.tif"
 
@@ -67,8 +72,8 @@ def gaussian(x: np.ndarray, amplitude: float, sigma: float, peak_value: float) -
 
 
 def find_background_threshold(stack_f16: np.ndarray, bins: int = HISTOGRAM_BINS,
-                               crossover_ratio: float = CROSSOVER_RATIO) -> float:
-    """fit histogram with gaussian; sweep x and then compare the ratio actual amplitude to fitted amplitude (> crossover_ratio)"""
+                               sigma_ratio: float = CROSSOVER_RATIO) -> float:
+    """fit histogram with gaussian; threshold = peak + sigma_ratio * fitted sigma"""
     # generate histogram
     values = stack_f16.ravel().astype(np.float32)
     hist, bin_edges = np.histogram(values, bins=bins)
@@ -83,14 +88,9 @@ def find_background_threshold(stack_f16: np.ndarray, bins: int = HISTOGRAM_BINS,
     popt, _ = curve_fit(partial(gaussian, peak_value=peak_value),
                          bin_centers[left_mask], hist[left_mask],
                          p0=[peak_height, 0.0016])
-    fit_y = gaussian(bin_centers, *popt, peak_value=peak_value)
+    _, sigma = popt
 
-    for i in range(peak_idx, len(hist) - 3):
-        if all(hist[i + k] > fit_y[i + k] * crossover_ratio for k in range(3)):
-            return float(bin_centers[i])
-
-    raise RuntimeError("no crossover found -- histogram never exceeds the fitted "
-                        "background curve by the given ratio")
+    return float(peak_value + sigma_ratio * sigma)
 
 
 # ---------------------------------------------------------------------------
@@ -111,11 +111,12 @@ def remove_small_objects(mask: np.ndarray, th_small_obj: int) -> np.ndarray:
 
 
 def detect_all_frames(stack_f16: np.ndarray, threshold: float,
-                       th_small_obj: int = TH_SMALL_OBJ) -> np.ndarray:
+                       th_small_obj: int = TH_SMALL_OBJ, close_radius: int = CLOSE_RADIUS) -> np.ndarray:
 
     # convert each frame of the tiff stack into a binary mask
     mask = stack_f16 > threshold
     mask = ndimage.binary_opening(mask, structure=np.ones((1, 3, 3)))  # drop lone bright pixels
+    mask = ndimage.binary_closing(mask, structure=np.ones((1, close_radius, close_radius)))  # simplify shape: close small notches/gaps
     for t in range(mask.shape[0]):
         mask[t] = ndimage.binary_fill_holes(mask[t])
     mask = remove_small_objects(mask, th_small_obj)
@@ -132,7 +133,7 @@ def main() -> None:
 
     _, stack_f16 = load_stack(STACK_PATH)
     threshold = find_background_threshold(stack_f16)
-    console.print(f"[cyan]background threshold[/cyan] (Gaussian-fit crossover, ratio={CROSSOVER_RATIO}): "
+    console.print(f"[cyan]background threshold[/cyan] (peak + {CROSSOVER_RATIO} sigma): "
                   f"[bold]{threshold:.5f}[/bold]")
 
     mask = detect_all_frames(stack_f16, threshold)

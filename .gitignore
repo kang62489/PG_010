@@ -11,3 +11,4 @@ wheels/
 
 # Big imaging files
 *.tif
+*.npz
