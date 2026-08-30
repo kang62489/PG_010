@@ -1,5 +1,5 @@
 """
-Paint each zone's hotspot footprints and render the final colored zone map.
+Paint each zone's hotspot footprints and render per-zone + combined zone maps.
 Does no detection work -- just looks up stored footprints/zone assignments.
 
 Pipeline:
@@ -7,21 +7,26 @@ Pipeline:
   2. Load corr_groups.xlsx's 3 sheets (groups, centroid_groups, resting) and
      assign every joint_label a single sequential zone id across all 3 sheets
   3. Union each zone's member joint_labels' footprints (across every frame
-     they were detected in) onto a full-size zone label map
-  4. Render over a background stack's mean projection; save as a png
+     they were detected in) into its own full-size boolean mask
+  4. Render one png per zone (that zone's thick contour outline over the
+     background projection), plus one final combined png (all zones as
+     translucent filled areas over the background projection)
 
 Requires: detections_raw.csv, hotspot_footprints.npz, corr_groups.xlsx (from 02_zone_groups.py)
 Run: uv run python 03_zone_map.py [background_stack.tif] [output_suffix] [mean|max] [gray|red|green|blue]
-Outputs: zone_map.png
+Outputs: results/zone_maps{suffix}_{stack_stem}_{projection}proj/  (one png per zone + one combined png)
 """
 
 import ast
+import glob
+import os
 import sys
 
 import numpy as np
 import pandas as pd
 import tifffile
 from skimage.color import label2rgb
+from skimage.measure import find_contours
 
 import matplotlib
 matplotlib.use("Agg")
@@ -41,9 +46,11 @@ BG_COLOR = sys.argv[4] if len(sys.argv) > 4 else "gray"  # "gray", "red", "green
 RAW_DETECTIONS_CSV = f"results/detections_raw{SUFFIX}.csv"
 HOTSPOT_FOOTPRINTS_NPZ = f"results/hotspot_footprints{SUFFIX}.npz"
 CORR_GROUPS_XLSX = f"results/corr_groups{SUFFIX}.xlsx"
+ZONE_CONTOURS_NPZ = f"results/zone_contours{SUFFIX}.npz"
+ZONE_FOOTPRINTS_NPZ = f"results/zone_footprints{SUFFIX}.npz"
 
 STACK_STEM = STACK_PATH.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-ZONE_MAP_PNG = f"results/zone_map{SUFFIX}_{STACK_STEM}_{PROJECTION}proj.png"
+ZONE_MAP_DIR = f"results/zone_maps{SUFFIX}_{STACK_STEM}_{PROJECTION}proj"
 
 
 # ---------------------------------------------------------------------------
@@ -64,25 +71,31 @@ def load_zone_assignments(xlsx_path: str) -> pd.DataFrame:
     resting = xl.parse("resting")
     resting["joint_labels"] = resting["joint_label"].apply(lambda l: [l])
 
+    groups["origin"] = [f"group {i}" for i in range(len(groups))]
+    centroid_groups["origin"] = [f"centroid_group {i}" for i in range(len(centroid_groups))]
+    resting["origin"] = [f"resting row {i}" for i in range(len(resting))]
+
     zones = pd.concat([
-        groups[["joint_labels"]].assign(sheet="groups"),
-        centroid_groups[["joint_labels"]].assign(sheet="centroid_groups"),
-        resting[["joint_labels"]].assign(sheet="resting"),
+        groups[["joint_labels", "origin"]].assign(sheet="groups"),
+        centroid_groups[["joint_labels", "origin"]].assign(sheet="centroid_groups"),
+        resting[["joint_labels", "origin"]].assign(sheet="resting"),
     ], ignore_index=True)
     zones["zone"] = range(1, len(zones) + 1)  # 1-based, 0 stays background
     return zones
 
 
 # ---------------------------------------------------------------------------
-# 3. Paint each zone's member footprints onto a full-size zone label map
+# 3. Union each zone's member footprints into its own boolean mask
 # ---------------------------------------------------------------------------
 
-def build_zone_label_map(zones: pd.DataFrame, detections: pd.DataFrame, footprints_path: str,
-                          H: int, W: int) -> np.ndarray:
-    """Full-size (H, W) int array: 0 = background, otherwise the zone id of
-    whichever zone's member footprint(s) cover that pixel."""
-    zone_label_map = np.zeros((H, W), dtype=np.int32)
+def build_zone_masks(zones: pd.DataFrame, detections: pd.DataFrame, footprints_path: str,
+                      H: int, W: int) -> dict[int, np.ndarray]:
+    """zone id -> full-size (H, W) boolean mask, True where any member
+    footprint (across every frame) covers that pixel. Kept per-zone (instead
+    of one shared int label map) so overlapping zones don't overwrite each
+    other's pixels."""
     joint_label_to_zone = {l: row.zone for row in zones.itertuples() for l in row.joint_labels}
+    zone_masks: dict[int, np.ndarray] = {}
 
     with np.load(footprints_path) as footprints:
         for i, row in enumerate(detections.itertuples()):
@@ -90,17 +103,18 @@ def build_zone_label_map(zones: pd.DataFrame, detections: pd.DataFrame, footprin
             if zone is None:
                 continue
             coords = footprints[f"hotspot_{i}"]
-            zone_label_map[coords[:, 0], coords[:, 1]] = zone
-    return zone_label_map
+            mask = zone_masks.setdefault(zone, np.zeros((H, W), dtype=bool))
+            mask[coords[:, 0], coords[:, 1]] = True
+    return zone_masks
 
 
 # ---------------------------------------------------------------------------
-# 4. Render the colored zone map
+# 4. Render helpers
 # ---------------------------------------------------------------------------
 
 def tint_background(background: np.ndarray, color: str) -> np.ndarray:
     """Normalize to [0, 1] and, unless gray, place into a single RGB channel
-    so label2rgb blends the zone colors over a solid-hue image instead of gray."""
+    so overlays blend the zone colors over a solid-hue image instead of gray."""
     bg_norm = (background - background.min()) / (background.max() - background.min())
     if color == "gray":
         return bg_norm
@@ -111,32 +125,93 @@ def tint_background(background: np.ndarray, color: str) -> np.ndarray:
     return bg_rgb
 
 
-def render_zone_map(zone_label_map: np.ndarray, zones: pd.DataFrame, detections: pd.DataFrame,
-                     background: np.ndarray, bg_color: str, out_path: str) -> None:
-    bg_tinted = tint_background(background, bg_color)
+def save_zone_footprints(zone_masks: dict[int, np.ndarray], out_path: str) -> None:
+    """Save each zone's full unioned footprint as an (N, 2) array of (row,
+    col) pixel coordinates, one key per zone: zone{id}."""
+    footprints = {f"zone{zone_id}": np.argwhere(mask) for zone_id, mask in zone_masks.items()}
+    np.savez(out_path, **footprints)
+
+
+def save_zone_contours(zone_masks: dict[int, np.ndarray], out_path: str) -> None:
+    """Save each zone's boundary line(s) as (row, col) float coordinate arrays.
+    A zone can be split into disconnected pieces, so each piece is stored
+    under its own key: zone{id}_part{k}."""
+    contours = {}
+    for zone_id, mask in zone_masks.items():
+        for i, contour in enumerate(find_contours(mask.astype(float), level=0.5)):
+            contours[f"zone{zone_id}_part{i}"] = contour
+    np.savez(out_path, **contours)
+
+
+def write_zone_sizes(zones: pd.DataFrame, zone_masks: dict[int, np.ndarray],
+                      xlsx_path: str) -> None:
+    """Append a 4th sheet to corr_groups.xlsx with each zone's pixel area."""
+    sizes = zones[["zone", "origin", "joint_labels"]].copy()
+    sizes["n_members"] = sizes["joint_labels"].apply(len)
+    sizes["pixel_area"] = sizes["zone"].map(lambda z: int(zone_masks[z].sum()) if z in zone_masks else 0)
+    sizes = sizes.drop(columns="joint_labels").sort_values("zone")
+
+    with pd.ExcelWriter(xlsx_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+        sizes.to_excel(writer, sheet_name="zone_sizes", index=False)
+
+
+def zone_centroid(zones: pd.DataFrame, detections: pd.DataFrame, zone_id: int):
+    """(y, x) centroid of a zone's member joint_labels, or None if no detections."""
+    centroids = detections.groupby("joint_label")[["centroid_y", "centroid_x"]].mean()
+    joint_labels = zones.loc[zones["zone"] == zone_id, "joint_labels"].iloc[0]
+    member_centroids = centroids.loc[centroids.index.intersection(joint_labels)]
+    if member_centroids.empty:
+        return None
+    return member_centroids["centroid_y"].mean(), member_centroids["centroid_x"].mean()
+
+
+def render_single_zone(zone_id: int, mask: np.ndarray, color, centroid, bg_tinted: np.ndarray,
+                        bg_color: str, out_path: str) -> None:
+    fig, ax = plt.subplots(figsize=(11, 11))
+    ax.imshow(bg_tinted, cmap="gray" if bg_color == "gray" else None)
+    ax.contour(mask.astype(float), levels=[0.5], colors=[color], linewidths=2.5)
+    if centroid is not None:
+        cy, cx = centroid
+        ax.text(cx, cy, str(zone_id), color="white", fontsize=9, fontweight="bold",
+                ha="center", va="center", bbox=dict(boxstyle="circle", fc="black", alpha=0.6))
+    ax.set_title(f"zone {zone_id} (on {STACK_STEM}, {PROJECTION} proj)")
+    ax.axis("off")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=120)
+    plt.close(fig)
+
+
+def render_zone_overlay(zone_masks: dict[int, np.ndarray], zones: pd.DataFrame,
+                         detections: pd.DataFrame, bg_tinted: np.ndarray, bg_color: str,
+                         H: int, W: int, out_path: str) -> None:
+    """All zones together as translucent filled areas (original overlay style)."""
+    zone_label_map = np.zeros((H, W), dtype=np.int32)
+    for zone_id in sorted(zone_masks):
+        zone_label_map[zone_masks[zone_id]] = zone_id
+
     overlay = label2rgb(zone_label_map, image=bg_tinted, bg_label=0, alpha=0.5,
                          colors=plt.cm.tab20.colors, saturation=1)
 
-    centroids = detections.groupby("joint_label")[["centroid_y", "centroid_x"]].mean()
     fig, ax = plt.subplots(figsize=(11, 11))
     ax.imshow(overlay)
-    for row in zones.itertuples():
-        member_centroids = centroids.loc[centroids.index.intersection(row.joint_labels)]
-        if member_centroids.empty:
+    for zone_id in sorted(zone_masks):
+        centroid = zone_centroid(zones, detections, zone_id)
+        if centroid is None:
             continue
-        cy, cx = member_centroids["centroid_y"].mean(), member_centroids["centroid_x"].mean()
-        ax.text(cx, cy, str(row.zone), color="white", fontsize=9, fontweight="bold",
+        cy, cx = centroid
+        ax.text(cx, cy, str(zone_id), color="white", fontsize=9, fontweight="bold",
                 ha="center", va="center", bbox=dict(boxstyle="circle", fc="black", alpha=0.6))
 
     n_groups = (zones["sheet"] == "groups").sum()
     n_centroid_groups = (zones["sheet"] == "centroid_groups").sum()
     n_resting = (zones["sheet"] == "resting").sum()
-    ax.set_title(f"{len(zones)} zones -- {n_groups} trace-corr, "
+    ax.set_title(f"{len(zone_masks)} zones -- {n_groups} trace-corr, "
                  f"{n_centroid_groups} centroid, {n_resting} resting "
                  f"(on {STACK_STEM}, {PROJECTION} proj)")
     ax.axis("off")
     plt.tight_layout()
     plt.savefig(out_path, dpi=120)
+    plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
@@ -149,13 +224,37 @@ def main() -> None:
 
     detections = pd.read_csv(RAW_DETECTIONS_CSV)
     zones = load_zone_assignments(CORR_GROUPS_XLSX)
-    zone_label_map = build_zone_label_map(zones, detections, HOTSPOT_FOOTPRINTS_NPZ, H, W)
+    zone_masks = build_zone_masks(zones, detections, HOTSPOT_FOOTPRINTS_NPZ, H, W)
 
     background = stack.max(axis=0) if PROJECTION == "max" else stack.mean(axis=0)
-    render_zone_map(zone_label_map, zones, detections, background, BG_COLOR, ZONE_MAP_PNG)
-    print(f"{len(zones)} zones ({(zones['sheet'] == 'groups').sum()} trace-corr, "
+    bg_tinted = tint_background(background, BG_COLOR)
+
+    write_zone_sizes(zones, zone_masks, CORR_GROUPS_XLSX)
+    save_zone_footprints(zone_masks, ZONE_FOOTPRINTS_NPZ)
+    save_zone_contours(zone_masks, ZONE_CONTOURS_NPZ)
+    os.makedirs(ZONE_MAP_DIR, exist_ok=True)
+    for stale_png in glob.glob(f"{ZONE_MAP_DIR}/*.png"):
+        os.remove(stale_png)
+
+    present_zones = sorted(zone_masks)
+    n_zones = len(present_zones)
+    width = len(str(n_zones + 1))
+    zone_color = {z: plt.cm.tab20.colors[i % len(plt.cm.tab20.colors)]
+                  for i, z in enumerate(present_zones)}
+
+    overlay_path = f"{ZONE_MAP_DIR}/{1:0{width}d}_all_zones.png"
+    render_zone_overlay(zone_masks, zones, detections, bg_tinted, BG_COLOR, H, W, overlay_path)
+
+    for i, zone_id in enumerate(present_zones, start=2):
+        centroid = zone_centroid(zones, detections, zone_id)
+        out_path = f"{ZONE_MAP_DIR}/{i:0{width}d}_zone{zone_id}.png"
+        render_single_zone(zone_id, zone_masks[zone_id], zone_color[zone_id], centroid,
+                            bg_tinted, BG_COLOR, out_path)
+
+    print(f"{n_zones} zones ({(zones['sheet'] == 'groups').sum()} trace-corr, "
           f"{(zones['sheet'] == 'centroid_groups').sum()} centroid, "
-          f"{(zones['sheet'] == 'resting').sum()} resting) -> {ZONE_MAP_PNG}")
+          f"{(zones['sheet'] == 'resting').sum()} resting) -> "
+          f"{n_zones + 1} pngs in {ZONE_MAP_DIR}/")
 
 
 if __name__ == "__main__":

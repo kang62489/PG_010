@@ -12,3 +12,4 @@ wheels/
 # Big imaging files
 *.tif
 *.npz
+*_meanproj/
