@@ -1,19 +1,22 @@
 """
-Categorize all detected hotspots as "zone" based on temporal correlation, centroid proximity, and a few other heuristics.
+Group detected hotspots into tracks and correlated clusters.
 
 Pipeline:
   1. Load stack + cleaned boolean mask (from 01)
-  2. Bridge spatial/temporal gaps in the mask, label in 3D, and build every
+  2. Per frame: label the mask, merge same-frame fragments whose boundaries
+     are within CONNECT_RADIUS (merge_adjacent_hotspots), and build every
      detection's frame, joint_label, centroid, and area
-  3. Collapse to one representative centroid per track
-  4. Pull each track's fixed-ROI deltaF/F0 trace, across the whole stack
-  5. Cluster tracks by trace correlation (gated by centroid distance) ->
-     zones, saved as zone_corr_matrix.csv
-  6. Map each detection's zone from its joint_label and save zone_groups.csv
+  3. Chain joint_labels across consecutive frames by centroid proximity
+     (assign_frame_adjacent_joint_labels), so a hotspot's detections across
+     frames share one joint_label
+  4. Pull each joint_label's own-footprint deltaF/F0 trace, across the
+     whole stack
+  5. Group joint_labels by trace correlation (first_grouping), then the
+     leftover joint_labels by centroid distance (second_grouping)
 
 Requires: mask.tif (from 01_detect_hotspots.py)
 Run: uv run python 02_zone_groups.py [stack.tif] [output_suffix]
-Outputs: detections_raw.csv, hotspot_footprints.npz, zone_groups.csv, zone_traces.png, zone_corr_matrix.csv
+Outputs: detections_raw.csv, hotspot_footprints.npz, corr_groups.xlsx
 """
 
 import importlib
@@ -26,13 +29,11 @@ import tifffile
 from rich.console import Console
 from scipy import ndimage
 from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.spatial import KDTree
 from scipy.spatial.distance import pdist, squareform
+from skimage.measure import regionprops
 
 detect_hotspots = importlib.import_module("01_detect_hotspots")
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 console = Console()
 
@@ -50,7 +51,7 @@ MASK_TIF = f"results/mask{SUFFIX}.tif"
 
 TH_SMALL_HOTSPOTS = 3000  # remove hotspots which is too small (px)
 
-CONNECT_RADIUS = 30  # px: bridge gaps up to this wide between fragments before
+CONNECT_RADIUS = 75  # px: bridge gaps up to this wide between fragments before
                       # labeling, so one real hotspot broken apart by a noisy
                       # dip is still detected as a single hotspot, not several
 
@@ -60,7 +61,7 @@ RAW_DETECTIONS_CSV = f"results/detections_raw{SUFFIX}.csv"
 # pixel coordinates of all detected hotspots
 HOTSPOT_FOOTPRINTS_NPZ = f"results/hotspot_footprints{SUFFIX}.npz"
 
-MAX_CENTROID_DEVIATION = 75  # px: second-stage grouping -- tracks left
+MAX_CENTROID_DEVIATION = 115  # px: second-stage grouping -- tracks left
                                # ungrouped by trace correlation can still
                                # join a group if their centroids stay within
                                # this of every other member (complete-linkage).
@@ -69,51 +70,95 @@ MIN_GROUP_CORR = 0.95  # first-pass grouping: complete-linkage clustering
                         # cut at this Pearson r -- every pair inside a group
                         # is guaranteed to correlate at least this much.
 
-ZONE_GROUPS_CSV = f"results/zone_groups{SUFFIX}.csv"
-ZONE_TRACES_PNG = f"results/zone_traces{SUFFIX}.png"
-ZONE_CORR_MATRIX_CSV = f"results/zone_corr_matrix{SUFFIX}.csv"
-
 CORR_GROUPS_XLSX = f"results/corr_groups{SUFFIX}.xlsx"
 
 
 # ---------------------------------------------------------------------------
-# 2. Bridge the mask in 3D (spatial only) and build per-detection rows
+# 2. Per-frame labeling + boundary-distance merging -> per-detection rows
 # ---------------------------------------------------------------------------
+
+def merge_adjacent_hotspots(labeled_frame: np.ndarray, connect_radius: float) -> np.ndarray:
+    """Merge same-frame labels whose boundaries are within connect_radius --
+    centroid-distance prefilter, then facing-half boundary points, then
+    KDTree nearest-neighbor for the true closest distance."""
+    regions = regionprops(labeled_frame)
+    if len(regions) <= 1:
+        return labeled_frame
+
+    boundaries: dict[int, np.ndarray] = {}
+    centroids: dict[int, np.ndarray] = {}
+    radii: dict[int, float] = {}
+    for region in regions:
+        eroded = ndimage.binary_erosion(region.image)
+        boundary_local = region.image & ~eroded
+        ys, xs = np.nonzero(boundary_local)
+        min_row, min_col = region.bbox[0], region.bbox[1]
+        pts = np.column_stack([ys + min_row, xs + min_col]).astype(np.float64)
+
+        centroid = np.array(region.centroid)
+        boundaries[region.label] = pts
+        centroids[region.label] = centroid
+        radii[region.label] = float(np.linalg.norm(pts - centroid, axis=1).max()) if len(pts) else 0.0
+
+    labels = [region.label for region in regions]
+    parent = {label: label for label in labels}
+
+    for i, label_a in enumerate(labels):
+        for label_b in labels[i + 1:]:
+            centroid_a, centroid_b = centroids[label_a], centroids[label_b]
+            direction = centroid_b - centroid_a
+            centroid_dist = float(np.linalg.norm(direction))
+
+            # prefilter 1: centroid distance alone already rules this pair out
+            if centroid_dist > radii[label_a] + radii[label_b] + connect_radius:
+                continue
+
+            # prefilter 2: only the boundary half facing the other region can
+            # hold the closest point (assumes roughly convex/blob-shaped regions)
+            pts_a, pts_b = boundaries[label_a], boundaries[label_b]
+            if centroid_dist > 0:
+                facing_a = pts_a[(pts_a - centroid_a) @ direction >= 0]
+                facing_b = pts_b[(pts_b - centroid_b) @ -direction >= 0]
+            else:
+                facing_a, facing_b = pts_a, pts_b
+            if len(facing_a) == 0 or len(facing_b) == 0:
+                continue
+
+            min_dist = float(KDTree(facing_b).query(facing_a, k=1)[0].min())
+            if min_dist <= connect_radius:
+                _union(parent, label_a, label_b)
+
+    remap = np.zeros(int(labeled_frame.max()) + 1, dtype=np.int32)
+    for label in labels:
+        remap[label] = _find(parent, label)
+    return remap[labeled_frame]
+
 
 def spatiotemporally_connect_hotspots(mask: np.ndarray, th_small_hotspots: int,
                                 connect_radius: int) -> tuple[pd.DataFrame, list]:
     t_start = time.time()
     console.print("[cyan]spatiotemporally_connect_hotspots:[/cyan] starting...")
 
-    # use dilation to check if two adjacent hotspots are actually one hotspot, if so, connect them (using OR operation).
-    bridged_mask = ndimage.binary_dilation(mask, structure=np.ones((1, connect_radius, connect_radius)))
-
-    # apply new label index to bridged_mask for several measurements with regionprops later --
-    # 2D only: scipy's label requires a (3,3,3) structure for 3D input, so the
-    # z-neighbor slices are zeroed out instead of shrinking the shape -- same
-    # "no connectivity between frames" effect, each frame labeled independently.
-    structure_2d = np.zeros((3, 3, 3))
-    structure_2d[1] = 1
-    labeled_bridged_mask, n_after = ndimage.label(bridged_mask, structure=structure_2d, output=np.int32)
-    del bridged_mask
-    console.print(f"[cyan]spatiotemporally_connect_hotspots:[/cyan] labeling done [dim]({time.time() - t_start:.1f}s)[/dim]")
-
-    # remove the connecting pixels (dilated pixels) from labeled_bridged_mask by AND operation with the original mask
     hotspots_props = []
     footprints = []
+    label_offset = 0
 
-    # each raw label from labeled_bridged_mask is already one 2D-connected
-    # component within its own frame (no cross-frame connectivity), so it's
-    # used directly as the joint_label -- no cross-frame tracking here yet.
+    # per-frame only (no cross-frame connectivity, no whole-mask dilation):
+    # label the raw mask, then merge_adjacent_hotspots bridges same-frame
+    # fragments via boundary distance instead of dilating the whole frame.
     for frame_id in range(mask.shape[0]):
-        for joint_label_at_frame_id in np.unique(labeled_bridged_mask[frame_id][mask[frame_id]]):
-            # above line using boolean mask indexing to get pixels that are truely bright in the original mask (not the dialated)
-            footprint_mask = mask[frame_id] & (labeled_bridged_mask[frame_id] == joint_label_at_frame_id)
+        frame_mask = mask[frame_id]
+        labeled_frame, n_frame_labels = ndimage.label(frame_mask, structure=np.ones((3, 3)))
+        if n_frame_labels > 1:
+            labeled_frame = merge_adjacent_hotspots(labeled_frame, connect_radius)
+
+        for joint_label_at_frame_id in np.unique(labeled_frame[frame_mask]):
+            footprint_mask = frame_mask & (labeled_frame == joint_label_at_frame_id)
             area = int(footprint_mask.sum())
             if area < th_small_hotspots:
                 continue
 
-            joint_label = int(joint_label_at_frame_id)
+            joint_label = int(joint_label_at_frame_id) + label_offset
 
             coords = np.argwhere(footprint_mask)
             footprints.append(coords)
@@ -124,6 +169,8 @@ def spatiotemporally_connect_hotspots(mask: np.ndarray, th_small_hotspots: int,
                 "centroid_x": float(coords[:, 1].mean()),
                 "area": area,
             })
+
+        label_offset += n_frame_labels
 
     n_after = pd.DataFrame(hotspots_props)["joint_label"].nunique() if hotspots_props else 0
     console.print(f"hotspots after spatial connecting: [bold]{n_after}[/bold]")
@@ -218,7 +265,7 @@ def first_grouping(tracks: pd.DataFrame, min_corr: float) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 4. Cluster tracks: centroid deviation gate + trace correlation
+# 4. Frame-adjacent track chaining, then two-stage grouping (trace corr, then centroid distance)
 # ---------------------------------------------------------------------------
 
 def track_centroids(hotspots_props: pd.DataFrame) -> pd.DataFrame:
@@ -248,19 +295,11 @@ def _union(parent: dict, a, b) -> None:
         parent[root_a] = root_b
 
 
-def chain_frame_adjacent_centroids(hotspots_props: pd.DataFrame, max_dist: float) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Standalone alternative to second_grouping, run over every joint_label
-    (not gated by trace correlation): instead of clustering any pair of
-    joint_labels whose centroids are within max_dist (regardless of how far
-    apart in time), only link a joint_label to one in the very next frame if
-    their centroids are within max_dist -- groups are then connected
-    components of this frame-by-frame chain, so two labels can only end up
-    in the same group via an unbroken frame-to-frame chain of close centroids.
-
-    Returns (result, edges): result has one row per joint_label with its
-    group id; edges has one row per frame-to-frame link actually used
-    (joint_label_a, joint_label_b, distance) -- lets the caller show which
-    specific centroid distances chained a group together."""
+def chain_frame_adjacent_centroids(hotspots_props: pd.DataFrame, max_dist: float) -> pd.DataFrame:
+    """Chain joint_labels across consecutive frames: only link a joint_label
+    to one in the very next frame if their centroids are within max_dist --
+    groups are connected components of this frame-by-frame chain, so two
+    labels only end up together via an unbroken frame-to-frame chain."""
     rows = hotspots_props.groupby("joint_label").agg(
         frame=("frame", "first"),
         centroid_y=("centroid_y", "mean"),
@@ -269,7 +308,6 @@ def chain_frame_adjacent_centroids(hotspots_props: pd.DataFrame, max_dist: float
 
     labels = rows["joint_label"].tolist()
     parent = {label: label for label in labels}
-    edges = []
 
     by_frame = {frame: g for frame, g in rows.groupby("frame")}
     for frame, current in by_frame.items():
@@ -281,19 +319,12 @@ def chain_frame_adjacent_centroids(hotspots_props: pd.DataFrame, max_dist: float
                 dist = np.hypot(row_a["centroid_y"] - row_b["centroid_y"], row_a["centroid_x"] - row_b["centroid_x"])
                 if dist < max_dist:
                     _union(parent, row_a["joint_label"], row_b["joint_label"])
-                    edges.append({
-                        "joint_label_a": row_a["joint_label"],
-                        "joint_label_b": row_b["joint_label"],
-                        "frame_a": row_a["frame"],
-                        "distance": dist,
-                    })
 
     roots = [_find(parent, label) for label in labels]
     group_id_map = {root: new for new, root in enumerate(pd.unique(np.array(roots)))}
     group_ids = [group_id_map[root] for root in roots]
 
-    result = pd.DataFrame({"joint_label": labels, "group": group_ids})
-    return result, pd.DataFrame(edges)
+    return pd.DataFrame({"joint_label": labels, "group": group_ids})
 
 
 def assign_frame_adjacent_joint_labels(hotspots_props: pd.DataFrame, max_dist: float) -> pd.DataFrame:
@@ -301,7 +332,7 @@ def assign_frame_adjacent_joint_labels(hotspots_props: pd.DataFrame, max_dist: f
     into a single joint_label -- so every detection belonging to the same
     chained track shares one joint_label before trace correlation runs,
     instead of one joint_label per single-frame detection."""
-    result, _ = chain_frame_adjacent_centroids(hotspots_props, max_dist)
+    result = chain_frame_adjacent_centroids(hotspots_props, max_dist)
     label_to_group = dict(zip(result["joint_label"], result["group"]))
 
     hotspots_props = hotspots_props.copy()
@@ -327,23 +358,6 @@ def second_grouping(centroids: pd.DataFrame, max_dist: float) -> pd.DataFrame:
     group_ids = [group_id_map[raw] for raw in raw_group_ids]
 
     return pd.DataFrame({"joint_label": labels, "group": group_ids})
-
-
-def cluster_by_centroid_deviation(corr: np.ndarray, centroid_dist: np.ndarray,
-                            min_trace_corr: float, max_centroid_deviation: float) -> np.ndarray:
-    """Hierarchical (average-linkage) clustering on 1 - correlation as the
-    distance, cut at distance (1 - min_trace_corr) -- except any pair whose
-    centroids are farther apart than max_centroid_deviation is forced to
-    distance 1 (== zero correlation) first, so two far-apart hotspots can
-    never share a zone no matter how well their traces correlate."""
-    distance = 1 - corr
-    distance[centroid_dist > max_centroid_deviation] = 1
-
-    np.fill_diagonal(distance, 0)
-    distance = (distance + distance.T) / 2  # force exact symmetry (fp round-trip)
-
-    linkage_matrix = linkage(squareform(distance, checks=False), method="average")
-    return fcluster(linkage_matrix, t=1 - min_trace_corr, criterion="distance")
 
 
 def export_corr_groups(hotspots_props: pd.DataFrame, footprints: list, stack_f16: np.ndarray,
@@ -405,30 +419,7 @@ def export_corr_groups(hotspots_props: pd.DataFrame, footprints: list, stack_f16
 
 
 # ---------------------------------------------------------------------------
-# 5. Render each zone's traces, for the sanity-check plot only.
-# ---------------------------------------------------------------------------
-
-def render_zone_traces(traces: np.ndarray, zones: np.ndarray, out_path: str) -> None:
-    zone_ids = sorted(set(zones))
-    n_cols = 4
-    n_rows = int(np.ceil(len(zone_ids) / n_cols))
-    _, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 2.2 * n_rows), squeeze=False)
-
-    for ax, zone_id in zip(axes.flat, zone_ids):
-        for trace in traces[zones == zone_id]:
-            ax.plot(trace, linewidth=0.5)
-        ax.set_title(f"zone {zone_id} (n_hotspots={np.sum(zones == zone_id)})", fontsize=9)
-        ax.tick_params(labelsize=6)
-
-    for ax in axes.flat[len(zone_ids):]:
-        ax.axis("off")
-
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=110)
-
-
-# ---------------------------------------------------------------------------
-# 6. Run the pipeline
+# 5. Run the pipeline
 # ---------------------------------------------------------------------------
 
 def main() -> None:
@@ -456,27 +447,6 @@ def main() -> None:
     console.print(f"[bold]{len(groups)}[/bold] trace-corr groups (r>{MIN_GROUP_CORR}), "
                   f"[bold]{len(centroid_groups)}[/bold] centroid groups (<{MAX_CENTROID_DEVIATION}px), "
                   f"[bold]{len(resting)}[/bold] resting -> {CORR_GROUPS_XLSX}")
-
-    # centroid_dist = squareform(pdist(centroids))
-    # corr = np.corrcoef(traces)
-    # pd.DataFrame(corr).to_csv(ZONE_CORR_MATRIX_CSV, index=False)
-    # console.print(f"[green]saved[/green] {len(joint_labels)}x{len(joint_labels)} track-level ROI trace correlation "
-    #               f"matrix -> {ZONE_CORR_MATRIX_CSV}")
-    #
-    # track_zones = cluster_by_centroid_deviation(corr, centroid_dist, MIN_GROUP_CORR, MAX_CENTROID_DEVIATION)
-    # zone_by_track = dict(zip(joint_labels, track_zones))
-    #
-    # hotspots_props = hotspots_props.copy()
-    # hotspots_props["zone"] = hotspots_props["joint_label"].map(zone_by_track)
-    # hotspots_props.to_csv(ZONE_GROUPS_CSV, index=False)
-    #
-    # own_traces = detection_traces(footprints, stack_f16)
-    # render_zone_traces(own_traces, hotspots_props["zone"].values, ZONE_TRACES_PNG)
-    #
-    # console.print(f"[bold]{hotspots_props['zone'].nunique()}[/bold] zones from {len(joint_labels)} tracks "
-    #               f"({len(hotspots_props)} detections) [dim](max_centroid_deviation={MAX_CENTROID_DEVIATION}px, "
-    #               f"min_group_corr={MIN_GROUP_CORR})[/dim]")
-    # console.print(f"[green]saved[/green] {ZONE_GROUPS_CSV}, {ZONE_TRACES_PNG}")
 
 
 if __name__ == "__main__":
