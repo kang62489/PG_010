@@ -12,9 +12,10 @@ Pipeline:
      background projection), plus one final combined png (all zones as
      translucent filled areas over the background projection)
 
-Requires: detections_raw.csv, hotspot_footprints.npz, corr_groups.xlsx (from 02_zone_groups.py)
-Run: uv run python 03_zone_map.py [background_stack.tif] [output_suffix] [mean|max] [gray|red|green|blue]
-Outputs: results/zone_maps{suffix}_{stack_stem}_{projection}proj/  (one png per zone + one combined png)
+Requires: detections_raw_{stack_stem}.csv, hotspot_footprints_{stack_stem}.npz,
+  corr_groups_{stack_stem}.xlsx (from 02_zone_groups.py, for the same stack)
+Run: uv run python 03_zone_map.py [stack.tif] [background_stack.tif] [mean|max] [gray|red|green|blue]
+Outputs: results/zone_maps_{stack_stem}_{projection}proj/  (one png per zone + one combined png)
 """
 
 import ast
@@ -34,14 +35,21 @@ import matplotlib.pyplot as plt
 
 # ---------------------------------------------------------------------------
 # 1. Config
-#    Usage: uv run python 03_zone_map.py [background_stack.tif] [output_suffix]
-#    Suffix must match the one used for 02_zone_groups.py's outputs.
+#    Usage: uv run python 03_zone_map.py [stack.tif] [background_stack.tif] [mean|max] [gray|red|green|blue]
+#    stack.tif must be the same stack passed to 01/02 for this run -- its
+#    filename stem is the lookup suffix for their outputs, and it sets the
+#    zone masks' H/W. background_stack.tif is a separate stack (defaults to
+#    stack.tif) that gets mean/max-projected and tinted for the rendered
+#    picture -- it does not need to be the same stack used for detection.
 # ---------------------------------------------------------------------------
 
-STACK_PATH = sys.argv[1] if len(sys.argv) > 1 else "raw_tiffs/2025_12_15-0003.tif"
-SUFFIX = f"_{sys.argv[2]}" if len(sys.argv) > 2 else "_ALS"
+STACK_PATH = sys.argv[1] if len(sys.argv) > 1 else "proc_tiffs/2025_12_15-0012_BIEXP_ALS.tif"
+BACKGROUND_STACK_PATH = sys.argv[2] if len(sys.argv) > 2 else STACK_PATH
 PROJECTION = sys.argv[3] if len(sys.argv) > 3 else "mean"  # "mean" or "max"
 BG_COLOR = sys.argv[4] if len(sys.argv) > 4 else "gray"  # "gray", "red", "green", or "blue"
+
+STACK_STEM = STACK_PATH.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+SUFFIX = f"_{STACK_STEM}"
 
 RAW_DETECTIONS_CSV = f"results/detections_raw{SUFFIX}.csv"
 HOTSPOT_FOOTPRINTS_NPZ = f"results/hotspot_footprints{SUFFIX}.npz"
@@ -49,8 +57,7 @@ CORR_GROUPS_XLSX = f"results/corr_groups{SUFFIX}.xlsx"
 ZONE_CONTOURS_NPZ = f"results/zone_contours{SUFFIX}.npz"
 ZONE_FOOTPRINTS_NPZ = f"results/zone_footprints{SUFFIX}.npz"
 
-STACK_STEM = STACK_PATH.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-ZONE_MAP_DIR = f"results/zone_maps{SUFFIX}_{STACK_STEM}_{PROJECTION}proj"
+ZONE_MAP_DIR = f"results/zone_maps{SUFFIX}_{PROJECTION}proj"
 
 
 # ---------------------------------------------------------------------------
@@ -184,9 +191,13 @@ def render_single_zone(zone_id: int, mask: np.ndarray, color, centroid, bg_tinte
 def render_zone_overlay(zone_masks: dict[int, np.ndarray], zones: pd.DataFrame,
                          detections: pd.DataFrame, bg_tinted: np.ndarray, bg_color: str,
                          H: int, W: int, out_path: str) -> None:
-    """All zones together as translucent filled areas (original overlay style)."""
+    """All zones together as translucent filled areas (original overlay style).
+    Painted largest-area zone first (bottom layer) down to smallest-area zone
+    last (top layer), so a small zone overlapping a large one stays visible
+    instead of being covered by it."""
     zone_label_map = np.zeros((H, W), dtype=np.int32)
-    for zone_id in sorted(zone_masks):
+    paint_order = sorted(zone_masks, key=lambda zone_id: zone_masks[zone_id].sum(), reverse=True)
+    for zone_id in paint_order:
         zone_label_map[zone_masks[zone_id]] = zone_id
 
     overlay = label2rgb(zone_label_map, image=bg_tinted, bg_label=0, alpha=0.5,
@@ -226,7 +237,8 @@ def main() -> None:
     zones = load_zone_assignments(CORR_GROUPS_XLSX)
     zone_masks = build_zone_masks(zones, detections, HOTSPOT_FOOTPRINTS_NPZ, H, W)
 
-    background = stack.max(axis=0) if PROJECTION == "max" else stack.mean(axis=0)
+    background_stack = stack if BACKGROUND_STACK_PATH == STACK_PATH else tifffile.imread(BACKGROUND_STACK_PATH)
+    background = background_stack.max(axis=0) if PROJECTION == "max" else background_stack.mean(axis=0)
     bg_tinted = tint_background(background, BG_COLOR)
 
     write_zone_sizes(zones, zone_masks, CORR_GROUPS_XLSX)

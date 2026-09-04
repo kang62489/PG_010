@@ -6,10 +6,11 @@ Pipeline:
   2. Find the background threshold from the stack's own histogram
   3. Threshold, clean, strip noise speckle -> save the cleaned boolean mask
 
-Run: uv run python 01_detect_hotspots.py [stack.tif] [output_suffix]
+Run: uv run python 01_detect_hotspots.py [stack.tif]
 
 Outputs:
-  - per-frame cleaned boolean mask, as a viewable uint8 TIFF (results/mask.tif)
+  - per-frame cleaned boolean mask, as a viewable uint8 TIFF
+    (results/mask_{stack_stem}.tif)
 """
 
 ## Modules
@@ -30,19 +31,23 @@ console = Console()
 
 # ---------------------------------------------------------------------------
 # 1. Config
-#    Usage: uv run python 01_detect_hotspots.py [stack.tif] [output_suffix]
+#    Usage: uv run python 01_detect_hotspots.py [stack.tif] [crossover_sigma]
+#    Output suffix is derived from the stack's own filename stem, so it
+#    always matches across 01/02/03 without a separately typed argument.
+#    crossover_sigma must match the value passed to 02_zone_groups.py for
+#    the same stack (it re-derives the same threshold for its own record).
 # ---------------------------------------------------------------------------
 
 STACK_PATH = sys.argv[1] if len(sys.argv) > 1 else "proc_tiffs/2025_12_15-0012_BIEXP_ALS.tif"
-SUFFIX = f"_{sys.argv[2]}" if len(sys.argv) > 2 else "_ALS"
+SUFFIX = f"_{STACK_PATH.rsplit('/', 1)[-1].rsplit('.', 1)[0]}"
 
 HISTOGRAM_BINS = 512  # resolution/division of the range/distribution of pixel values (df/F0)
                       # (max - min) / HISTOGRAM_BINS = width of each bin in the histogram
                       # x is the center of each bin, y is the count of pixels in that bin.
 
-CROSSOVER_RATIO = 2  # background threshold = peak + this many fitted-Gaussian
-                       # sigmas -- the wider the background's noise spread, the
-                       # farther out this pushes the threshold.
+CROSSOVER_RATIO = float(sys.argv[2]) if len(sys.argv) > 2 else 2  # background threshold =
+                       # peak + this many fitted-Gaussian sigmas -- the wider the
+                       # background's noise spread, the farther out this pushes the threshold.
 
 TH_SMALL_OBJ = 4000  # remove small objects (px) before linking, general cleaning of noise speckle.
 

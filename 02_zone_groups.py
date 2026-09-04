@@ -14,9 +14,14 @@ Pipeline:
   5. Group joint_labels by trace correlation (first_grouping), then the
      leftover joint_labels by centroid distance (second_grouping)
 
-Requires: mask.tif (from 01_detect_hotspots.py)
-Run: uv run python 02_zone_groups.py [stack.tif] [output_suffix]
-Outputs: detections_raw.csv, hotspot_footprints.npz, corr_groups.xlsx
+Requires: mask_{stack_stem}.tif (from 01_detect_hotspots.py)
+Run: uv run python 02_zone_groups.py [stack.tif] [crossover_sigma]
+  crossover_sigma must match the value passed to 01_detect_hotspots.py for
+  the same stack -- it's only used here to recompute the same threshold
+  value for the record (hotspot_footprints_{stack_stem}.npz); the mask
+  itself is loaded as-is from 01's output.
+Outputs: detections_raw_{stack_stem}.csv, hotspot_footprints_{stack_stem}.npz,
+  corr_groups_{stack_stem}.xlsx
 """
 
 import importlib
@@ -39,12 +44,13 @@ console = Console()
 
 # ---------------------------------------------------------------------------
 # 1. Config
-#    Usage: uv run python 02_zone_groups.py [stack.tif] [output_suffix]
-#    Suffix must match the one used for 01_detect_hotspots.py's outputs.
+#    Usage: uv run python 02_zone_groups.py [stack.tif]
+#    Output suffix is derived from the stack's own filename stem, so it
+#    always matches 01_detect_hotspots.py's outputs for the same stack.
 # ---------------------------------------------------------------------------
 
 STACK_PATH = sys.argv[1] if len(sys.argv) > 1 else "proc_tiffs/2025_12_15-0012_BIEXP_ALS.tif"
-SUFFIX = f"_{sys.argv[2]}" if len(sys.argv) > 2 else "_ALS"
+SUFFIX = f"_{STACK_PATH.rsplit('/', 1)[-1].rsplit('.', 1)[0]}"
 
 # per-frame cleaned boolean mask, as a uint8 TIFF (from 01_detect_hotspots.py)
 MASK_TIF = f"results/mask{SUFFIX}.tif"
@@ -247,6 +253,9 @@ def first_grouping(tracks: pd.DataFrame, min_corr: float) -> pd.DataFrame:
     connected-components, which can chain two poorly-correlated tracks
     together through an intermediate one."""
     labels = tracks["joint_label"].tolist()
+    if len(labels) == 1:
+        return pd.DataFrame({"joint_label": labels, "group": [0]})
+
     traces = np.stack(tracks["trace"].values)
 
     corr = np.corrcoef(traces)
@@ -346,6 +355,11 @@ def second_grouping(centroids: pd.DataFrame, max_dist: float) -> pd.DataFrame:
     guarantees every pair inside a group has centroids within max_dist of
     each other, same complete-linkage guarantee as first_grouping."""
     labels = centroids["joint_label"].tolist()
+    if len(labels) == 0:
+        return pd.DataFrame({"joint_label": [], "group": []})
+    if len(labels) == 1:
+        return pd.DataFrame({"joint_label": labels, "group": [0]})
+
     coords = np.stack(centroids["mean_centroid"].values)
 
     distance = squareform(pdist(coords))
